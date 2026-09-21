@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Signal Map</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--mut:#8b949e;--g:#2ea043;--o:#f0883e;--r:#f85149}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+  body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+  header{padding:10px 14px;display:flex;justify-content:space-between;align-items:center;background:var(--panel)}
+  h1{font-size:16px;margin:0}
+  #status{font-size:12px;color:var(--mut)}
+  #map{flex:1;width:100%;min-height:0;display:block;touch-action:none}
+  .bar{display:flex;gap:8px;padding:10px 14px;background:var(--panel);flex-wrap:wrap;align-items:center}
+  button,input{background:#21262d;color:var(--fg);border:1px solid #30363d;border-radius:8px;padding:8px 12px;font:inherit}
+  button.primary{background:#238636;border-color:#2ea043}
+  input{flex:1;min-width:140px}
+  .stat{display:flex;gap:14px;padding:6px 14px;background:var(--panel);font-size:12px;color:var(--mut);flex-wrap:wrap}
+  .stat b{color:var(--fg)}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
+</style>
+</head>
+<body>
+<header><h1>Signal Map</h1><span id="status">idle</span></header>
+<canvas id="map"></canvas>
+<div class="stat">
+  <span><span class="dot" style="background:var(--g)"></span>good</span>
+  <span><span class="dot" style="background:var(--o)"></span>fair</span>
+  <span><span class="dot" style="background:var(--r)"></span>poor</span>
+  <span>Now: <b id="now">–</b></span>
+  <span>Points: <b id="count">0</b></span>
+  <span>Source: <b id="src">latency</b></span>
+</div>
+<div class="bar">
+  <button class="primary" id="start">Start</button>
+  <button id="lora">Connect LoRa</button>
+  <button id="sim">Simulate</button>
+  <button id="clear">Clear</button>
+  <button id="export">Export</button>
+  <input id="fromNode" placeholder="Only from node (hex id, optional)">
+  <input id="bridge" placeholder="Optional dBm bridge URL, e.g. http://localhost:8080/rssi">
+</div>
+
+<script>
+// ---------- config ----------
+const INTERVAL_MS = 3000;
+// dBm thresholds (LTE RSRP-style). Latency thresholds used when no dBm source.
+const DBM_GOOD = -90, DBM_FAIR = -105;
+const RTT_GOOD = 150, RTT_FAIR = 400;
+const COL = {good:'#2ea043', fair:'#f0883e', poor:'#f85149'};
+
+// ---------- state ----------
+let points = [];          // {x,y,cls,val,unit}
+let origin = null;        // {lat,lon}
+let lastFix = null;       // {lat,lon,acc}
+let watchId = null, timer = null, simTimer = null, running = false, simulating = false;
+let wake = null;
+let loraMode = false;
+const LORA_GOOD = -100, LORA_FAIR = -115; // dBm, tuned for LongFast-ish links
+function classifyLora(d){ return d >= LORA_GOOD ? 'good' : d >= LORA_FAIR ? 'fair' : 'poor'; }
+function addLoraPoint(rssi, snr){
+  if(!lastFix){ $('status').textContent = 'packet heard, waiting for GPS…'; return; }
+  if(!origin) origin = {lat:lastFix.lat, lon:lastFix.lon};
+  const {x,y} = toXY(lastFix.lat, lastFix.lon);
+  const cls = classifyLora(rssi);
+  points.push({x,y,cls,val:rssi,unit:'dBm',snr});
+  $('now').textContent = `${rssi} dBm, SNR ${snr} (${cls})`;
+  $('count').textContent = points.length;
+  $('src').textContent = 'LoRa RSSI';
+  draw();
+}
+
+const $ = id => document.getElementById(id);
+const canvas = $('map'), ctx = canvas.getContext('2d');
+
+// ---------- helpers ----------
+function toXY(lat, lon){
+  const x = (lon - origin.lon) * 111320 * Math.cos(origin.lat * Math.PI/180);
+  const y = (lat - origin.lat) * 110540;
+  return {x, y};
+}
+function classifyDbm(d){ return d >= DBM_GOOD ? 'good' : d >= DBM_FAIR ? 'fair' : 'poor'; }
+function classifyRtt(ms){ return ms == null ? 'poor' : ms < RTT_GOOD ? 'good' : ms < RTT_FAIR ? 'fair' : 'poor'; }
+
+async function probeRtt(){
+  const t0 = performance.now();
+  try{
+    const url = location.href.split('#')[0].split('?')[0] + '?p=' + Date.now();
+    const ctl = new AbortController();
+    const to = setTimeout(()=>ctl.abort(), 4000);
+    await fetch(url, {method:'HEAD', cache:'no-store', signal:ctl.signal});
+    clearTimeout(to);
+    return performance.now() - t0;
+  }catch(e){ return null; }
+}
+async function readBridge(){
+  const u = $('bridge').value.trim();
+  if(!u) return null;
+  try{
+    const r = await fetch(u, {cache:'no-store'});
+    const j = await r.json();
+    const v = j.dbm ?? j.rssi ?? j.rsrp;
+    return typeof v === 'number' ? v : null;
+  }catch(e){ return null; }
+}
+
+// ---------- sampling ----------
+async function sample(){
+  if(loraMode) return;
+  if(!lastFix) { $('status').textContent = 'waiting for GPS…'; return; }
+  if(!origin) origin = {lat:lastFix.lat, lon:lastFix.lon};
+  const {x,y} = toXY(lastFix.lat, lastFix.lon);
+
+  let cls, val, unit;
+  const dbm = await readBridge();
+  if(dbm != null){ cls = classifyDbm(dbm); val = Math.round(dbm); unit = 'dBm'; $('src').textContent = 'dBm bridge'; }
+  else {
+    const rtt = await probeRtt();
+    cls = classifyRtt(rtt); val = rtt == null ? null : Math.round(rtt); unit = 'ms';
+    $('src').textContent = 'latency proxy';
+  }
+  points.push({x,y,cls,val,unit});
+  $('now').textContent = val == null ? 'no response' : `${val} ${unit} (${cls})`;
+  $('count').textContent = points.length;
+  $('status').textContent = `GPS ±${Math.round(lastFix.acc)} m`;
+  draw();
+}
+
+function start(){
+  if(!('geolocation' in navigator)){ $('status').textContent = 'no geolocation'; return; }
+  stopSim();
+  running = true; $('start').textContent = 'Stop';
+  watchId = navigator.geolocation.watchPosition(
+    p => { lastFix = {lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy}; },
+    e => { $('status').textContent = 'GPS error: ' + e.message; },
+    {enableHighAccuracy:true, maximumAge:1000, timeout:10000});
+  timer = setInterval(sample, INTERVAL_MS);
+  if('wakeLock' in navigator) navigator.wakeLock.request('screen').then(w=>wake=w).catch(()=>{});
+}
+function stop(){
+  running = false; $('start').textContent = 'Start';
+  if(watchId != null) navigator.geolocation.clearWatch(watchId);
+  clearInterval(timer); watchId = timer = null;
+  if(wake){ wake.release(); wake = null; }
+}
+
+// ---------- simulation (desktop testing) ----------
+function fakeSignal(x,y){
+  // two "towers" with a dead zone in between
+  const d1 = Math.hypot(x+120,y-40), d2 = Math.hypot(x-140,y+60);
+  const d = Math.min(d1,d2);
+  return -65 - d*0.25 + (Math.random()-0.5)*6;
+}
+function startSim(){
+  stop(); clear(); simulating = true; $('sim').textContent = 'Stop sim';
+  let x=0,y=0,hd=0;
+  $('src').textContent = 'simulated dBm';
+  simTimer = setInterval(()=>{
+    hd += (Math.random()-0.5)*0.8; x += Math.cos(hd)*6; y += Math.sin(hd)*6;
+    const dbm = fakeSignal(x,y);
+    points.push({x,y,cls:classifyDbm(dbm),val:Math.round(dbm),unit:'dBm'});
+    $('now').textContent = `${Math.round(dbm)} dBm (${classifyDbm(dbm)})`;
+    $('count').textContent = points.length; draw();
+  }, 250);
+}
+function stopSim(){ simulating = false; clearInterval(simTimer); simTimer = null; $('sim').textContent = 'Simulate'; }
+
+// ---------- drawing ----------
+function resize(){
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  canvas.width = r.width*dpr; canvas.height = r.height*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0); draw();
+}
+function draw(){
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0,0,W,H);
+  if(!points.length){
+    ctx.fillStyle = '#8b949e'; ctx.textAlign = 'center';
+    ctx.fillText('Press Start and walk around (or Simulate)', W/2, H/2); return;
+  }
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for(const p of points){ minX=Math.min(minX,p.x); maxX=Math.max(maxX,p.x); minY=Math.min(minY,p.y); maxY=Math.max(maxY,p.y); }
+  const spanX = Math.max(maxX-minX, 40), spanY = Math.max(maxY-minY, 40), pad = 30;
+  const s = Math.min((W-2*pad)/spanX, (H-2*pad)/spanY);
+  const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+  const sx = x => W/2 + (x-cx)*s, sy = y => H/2 - (y-cy)*s;
+
+  // grid
+  ctx.strokeStyle = '#1c222b'; ctx.lineWidth = 1;
+  const step = s*10 < 20 ? 50 : 10;
+  for(let gx = Math.floor((cx-W/2/s)/step)*step; gx < cx+W/2/s; gx += step){ ctx.beginPath(); ctx.moveTo(sx(gx),0); ctx.lineTo(sx(gx),H); ctx.stroke(); }
+  for(let gy = Math.floor((cy-H/2/s)/step)*step; gy < cy+H/2/s; gy += step){ ctx.beginPath(); ctx.moveTo(0,sy(gy)); ctx.lineTo(W,sy(gy)); ctx.stroke(); }
+
+  // heat blobs
+  const rad = Math.max(14, Math.min(40, s*8));
+  for(const p of points){
+    const g = ctx.createRadialGradient(sx(p.x),sy(p.y),0,sx(p.x),sy(p.y),rad);
+    g.addColorStop(0, COL[p.cls]+'cc'); g.addColorStop(1, COL[p.cls]+'00');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sx(p.x),sy(p.y),rad,0,7); ctx.fill();
+  }
+  // solid dots + path
+  ctx.lineWidth = 1; ctx.strokeStyle = '#ffffff22'; ctx.beginPath();
+  points.forEach((p,i)=>{ i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y)); }); ctx.stroke();
+  for(const p of points){ ctx.fillStyle = COL[p.cls]; ctx.beginPath(); ctx.arc(sx(p.x),sy(p.y),4,0,7); ctx.fill(); }
+  // current
+  const l = points[points.length-1];
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(sx(l.x),sy(l.y),8,0,7); ctx.stroke();
+
+  // scale bar
+  const m = s*20 > 40 ? 20 : 50;
+  ctx.fillStyle = '#e6edf3'; ctx.fillRect(14, H-20, m*s, 2);
+  ctx.textAlign = 'left'; ctx.font = '11px system-ui'; ctx.fillText(m+' m', 14, H-26);
+}
+
+function clear(){ points = []; origin = null; $('count').textContent = 0; $('now').textContent = '–'; draw(); }
+function exportJson(){
+  const blob = new Blob([JSON.stringify({origin, points}, null, 1)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'signal-map.json'; a.click();
+}
+
+$('start').onclick = () => running ? stop() : start();
+$('sim').onclick = () => simulating ? stopSim() : startSim();
+$('clear').onclick = clear;
+$('export').onclick = exportJson;
+addEventListener('resize', resize);
+resize();
+</script>
+
+<script type="module">
+// Meshtastic over Web Bluetooth (Chrome/Edge on Android, HTTPS required)
+$('lora').onclick = async () => {
+  try{
+    $('status').textContent = 'loading Meshtastic libs…';
+    const [{MeshDevice}, {TransportWebBluetooth}] = await Promise.all([
+      import('https://esm.sh/@meshtastic/core'),
+      import('https://esm.sh/@meshtastic/transport-web-bluetooth')
+    ]);
+    const transport = await TransportWebBluetooth.create(); // opens the BLE chooser
+    const device = new MeshDevice(transport);
+    let myNum = null;
+    device.events.onMyNodeInfo?.subscribe(i => { myNum = i.myNodeNum; });
+    device.events.onMeshPacket.subscribe(pkt => {
+      const rssi = pkt.rxRssi, snr = pkt.rxSnr;
+      if(!rssi) return;                       // 0 = not received over the air (own/phone packets)
+      if(myNum != null && pkt.from === myNum) return;
+      const want = $('fromNode').value.trim().replace('!','');
+      if(want && pkt.from !== parseInt(want,16)) return;
+      addLoraPoint(rssi, snr);
+    });
+    if(typeof device.configure === 'function') await device.configure();
+    stopSim(); loraMode = true;
+    if(!running) start();
+    $('lora').textContent = 'LoRa connected';
+    $('status').textContent = 'connected — waiting for packets';
+  }catch(e){ $('status').textContent = 'LoRa error: ' + (e.message || e); console.error(e); }
+};
+</script>
+</body>
+</html>

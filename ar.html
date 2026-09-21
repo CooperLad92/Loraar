@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RSSI Point Cloud (AR)</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#0d1117;color:#e6edf3;font:13px system-ui,sans-serif;overflow:hidden}
+  canvas{position:fixed;inset:0;z-index:0}
+  #ui{position:fixed;inset:0;z-index:1;display:flex;flex-direction:column;justify-content:space-between;pointer-events:none;
+      padding:env(safe-area-inset-top) 10px env(safe-area-inset-bottom)}
+  #ui>*{pointer-events:auto}
+  .card{background:#0d1117cc;border-radius:10px;padding:8px 10px;margin:8px 0}
+  #legend{height:8px;border-radius:4px;margin-top:6px;background:linear-gradient(90deg,#f00,#ff0,#0f0)}
+  #legend+div{display:flex;justify-content:space-between;font-size:11px;color:#8b949e}
+  .row{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+  button{background:#21262dee;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:9px 11px;font:inherit}
+  button.primary{background:#238636;border-color:#2ea043}
+  button.on{outline:2px solid #2ea043}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="card">
+    <div><b id="now">no RSSI yet</b> · points <b id="count">0</b> · <span id="status">idle</span></div>
+    <div id="legend"></div><div><span>-120 dBm</span><span>-100</span><span>-80</span></div>
+  </div>
+  <div class="row">
+    <button id="ar" class="primary">Start AR</button>
+    <button id="lora">Connect LoRa</button>
+    <button id="sim">Sim RSSI</button>
+    <button id="paint" class="on">Paint</button>
+    <button id="flip">Flip Y</button>
+    <button id="clear">Clear</button>
+    <button id="ply">Export PLY</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://esm.sh/three@0.160.0';
+
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+
+// ---------- config ----------
+const CAP = 300000;        // max points
+const VOXEL = 0.04;        // m; re-visiting a voxel overwrites its colour
+const STAMP_MS = 400;      // painting interval
+const MAX_AGE_S = 90;      // stop painting if RSSI older than this
+const GX = 20, GY = 28;    // depth sample grid per stamp
+const MAXD = 6;            // m, ignore depth beyond this
+const RSSI_LO = -120, RSSI_HI = -80;
+
+// ---------- scene ----------
+const pos = new Float32Array(CAP*3), col = new Float32Array(CAP*3);
+let n = 0, dirty = false;
+const voxels = new Map();
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos,3).setUsage(THREE.DynamicDrawUsage));
+geo.setAttribute('color',    new THREE.BufferAttribute(col,3).setUsage(THREE.DynamicDrawUsage));
+geo.setDrawRange(0,0);
+const cloud = new THREE.Points(geo, new THREE.PointsMaterial({size:0.035, vertexColors:true, sizeAttenuation:true}));
+cloud.frustumCulled = false;
+const scene = new THREE.Scene(); scene.add(cloud);
+const camera = new THREE.PerspectiveCamera();
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight); renderer.setClearAlpha(0);
+renderer.xr.enabled = true; renderer.xr.setReferenceSpaceType('local');
+document.body.prepend(renderer.domElement);
+
+const tmpC = new THREE.Color();
+function rssiColor(d){
+  const t = Math.min(1, Math.max(0, (d-RSSI_LO)/(RSSI_HI-RSSI_LO)));
+  return tmpC.setHSL(t*0.33, 1, 0.5);   // red -> yellow -> green
+}
+function addPoint(x,y,z,c){
+  const key = Math.round(x/VOXEL)+','+Math.round(y/VOXEL)+','+Math.round(z/VOXEL);
+  let i = voxels.get(key);
+  if(i === undefined){
+    if(n >= CAP) return;
+    i = n++; voxels.set(key, i);
+    pos[i*3]=x; pos[i*3+1]=y; pos[i*3+2]=z;
+  }
+  col[i*3]=c.r; col[i*3+1]=c.g; col[i*3+2]=c.b;
+  dirty = true;
+}
+
+// ---------- RSSI sources ----------
+let rssi = {v:null, snr:null, t:0};
+let simOn = false, paint = true, flipY = false, start = null;
+
+$('sim').onclick = () => { simOn = !simOn; $('sim').classList.toggle('on', simOn); };
+$('paint').onclick = () => { paint = !paint; $('paint').classList.toggle('on', paint); };
+$('flip').onclick = () => { flipY = !flipY; $('flip').classList.toggle('on', flipY); };
+$('clear').onclick = () => { n = 0; voxels.clear(); dirty = true; };
+
+$('lora').onclick = async () => {
+  try{
+    status('loading Meshtastic libs…');
+    const [{MeshDevice}, {TransportWebBluetooth}] = await Promise.all([
+      import('https://esm.sh/@meshtastic/core'),
+      import('https://esm.sh/@meshtastic/transport-web-bluetooth')
+    ]);
+    const transport = await TransportWebBluetooth.create();
+    const device = new MeshDevice(transport);
+    let myNum = null;
+    device.events.onMyNodeInfo?.subscribe(i => { myNum = i.myNodeNum; });
+    device.events.onMeshPacket.subscribe(pkt => {
+      if(!pkt.rxRssi) return;
+      if(myNum != null && pkt.from === myNum) return;
+      rssi = {v:pkt.rxRssi, snr:pkt.rxSnr, t:performance.now()};
+    });
+    if(typeof device.configure === 'function') await device.configure();
+    simOn = false; $('sim').classList.remove('on');
+    $('lora').textContent = 'LoRa connected';
+    status('LoRa connected — start AR');
+  }catch(e){ status('LoRa error: ' + (e.message||e)); console.error(e); }
+};
+
+// ---------- depth -> world points ----------
+const proj = new THREE.Matrix4(), invProj = new THREE.Matrix4(), camM = new THREE.Matrix4();
+const v4 = new THREE.Vector4(), v3 = new THREE.Vector3();
+function stampDepth(view, di, c){
+  proj.fromArray(view.projectionMatrix); invProj.copy(proj).invert();
+  camM.fromArray(view.transform.matrix);
+  let k = 0;
+  for(let iy=0; iy<GY; iy++) for(let ix=0; ix<GX; ix++){
+    const u = (ix+0.5)/GX, w = (iy+0.5)/GY;
+    const d = di.getDepthInMeters(u, flipY ? 1-w : w);
+    if(!(d > 0.2 && d < MAXD)) continue;
+    v4.set(u*2-1, 1-w*2, 1, 1).applyMatrix4(invProj);      // ray direction in view space
+    v3.set(v4.x/v4.w, v4.y/v4.w, v4.z/v4.w);
+    v3.multiplyScalar(d / -v3.z).applyMatrix4(camM);        // depth along optical axis -> world
+    addPoint(v3.x, v3.y, v3.z, c); k++;
+  }
+  return k;
+}
+
+// ---------- XR frame loop ----------
+let lastStamp = 0, depthOK = false;
+function onXRFrame(t, frame){
+  const pose = frame.getViewerPose(renderer.xr.getReferenceSpace());
+  if(!pose) return;
+  const p = pose.transform.position;
+  if(!start) start = new THREE.Vector3(p.x,p.y,p.z);
+  if(simOn){
+    const dist = Math.hypot(p.x-start.x, p.z-start.z);
+    rssi = {v:Math.round(-65 - dist*6 + (Math.random()-0.5)*4), snr:null, t:performance.now()};
+  }
+  const age = (performance.now()-rssi.t)/1000;
+  $('now').textContent = rssi.v == null ? 'no RSSI yet' : `${rssi.v} dBm · ${age.toFixed(0)}s old`;
+  $('count').textContent = n;
+  if(!paint || rssi.v == null || age > MAX_AGE_S || t - lastStamp < STAMP_MS) return;
+  lastStamp = t;
+  const c = rssiColor(rssi.v).clone();
+  addPoint(p.x, p.y, p.z, c);                                // trail at the phone's own position
+  let got = 0;
+  for(const view of pose.views){
+    let di = null; try{ di = frame.getDepthInformation(view); }catch(e){}
+    if(di) got += stampDepth(view, di, c);
+  }
+  status(depthOK ? `depth pts +${got}` : 'no depth sensor: trail only');
+}
+renderer.setAnimationLoop((t, frame) => {
+  if(frame) onXRFrame(t, frame);
+  if(dirty){
+    geo.attributes.position.needsUpdate = true; geo.attributes.color.needsUpdate = true;
+    geo.setDrawRange(0, n); dirty = false;
+  }
+  renderer.render(scene, camera);
+});
+
+// ---------- start AR ----------
+$('ar').onclick = async () => {
+  try{
+    if(!navigator.xr) return status('WebXR unavailable (use Chrome on an ARCore Android phone, over HTTPS)');
+    if(!await navigator.xr.isSessionSupported('immersive-ar')) return status('immersive-ar not supported on this device');
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local'],
+      optionalFeatures: ['dom-overlay', 'depth-sensing'],
+      domOverlay: {root: $('ui')},
+      depthSensing: {usagePreference:['cpu-optimized'], dataFormatPreference:['luminance-alpha','float32']}
+    });
+    await renderer.xr.setSession(session);
+    depthOK = !!session.depthUsage;
+    start = null;
+    status(depthOK ? 'AR running, depth ON' : 'AR running, depth unavailable');
+  }catch(e){ status('AR error: ' + (e.message||e)); console.error(e); }
+};
+
+// ---------- export ----------
+$('ply').onclick = () => {
+  const L = [`ply`,`format ascii 1.0`,`element vertex ${n}`,`property float x`,`property float y`,`property float z`,
+             `property uchar red`,`property uchar green`,`property uchar blue`,`end_header`];
+  for(let i=0;i<n;i++) L.push(`${pos[i*3].toFixed(3)} ${pos[i*3+1].toFixed(3)} ${pos[i*3+2].toFixed(3)} ${Math.round(col[i*3]*255)} ${Math.round(col[i*3+1]*255)} ${Math.round(col[i*3+2]*255)}`);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([L.join('\n')], {type:'text/plain'}));
+  a.download = 'rssi-cloud.ply'; a.click();
+};
+addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
+</script>
+</body>
+</html>

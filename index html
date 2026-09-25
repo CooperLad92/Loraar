@@ -235,8 +235,8 @@ $('lora').onclick = async () => {
   try{
     $('status').textContent = 'loading Meshtastic libs…';
     const [{MeshDevice}, {TransportWebBluetooth}] = await Promise.all([
-      import('https://esm.sh/@meshtastic/core'),
-      import('https://esm.sh/@meshtastic/transport-web-bluetooth')
+      import('https://cdn.jsdelivr.net/npm/@meshtastic/core/+esm'),
+      import('https://cdn.jsdelivr.net/npm/@meshtastic/transport-web-bluetooth/+esm')
     ]);
     const transport = await TransportWebBluetooth.create(); // opens the BLE chooser
     const device = new MeshDevice(transport);
